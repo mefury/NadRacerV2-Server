@@ -86,6 +86,7 @@ PRIVY_APP_ID=your_privy_app_id
 PRIVY_SECRET_KEY=your_privy_secret_key
 PRIVATE_KEY=your_wallet_private_key
 GAME_ADDRESS=0x...           # Smart contract address
+MONAD_RPC_URL=https://testnet-rpc.monad.xyz  # RPC endpoint
 ```
 
 ### Rate Limiting & Anti-Cheat
@@ -94,6 +95,14 @@ RATE_LIMIT_GENERAL_WINDOW_MS=900000
 RATE_LIMIT_GENERAL_MAX=100
 MAX_REASONABLE_SCORE=10000
 # See .env.example for complete configuration
+```
+
+## 🌐 External APIs
+
+Optionally configure external API endpoints via env:
+```env
+# Leaderboard API base URL (no trailing slash needed in code)
+LEADERBOARD_API_URL=https://www.monadclip.fun/api/leaderboard
 ```
 
 ## 📚 API Endpoints
@@ -139,7 +148,7 @@ Response: { success: true, data: { ... } }
 - **Flexible CORS Protection**: Environment-configurable allowed origins
 - **Security Headers**: Helmet middleware for enhanced security
 
-## 🌐 CORS Configuration
+## 🌐 CORS & CSP Configuration
 
 The server supports flexible CORS configuration through environment variables:
 
@@ -150,6 +159,18 @@ The server supports flexible CORS configuration through environment variables:
 ```env
 FRONTEND_URL=https://nadracer.com
 CORS_ALLOWED_ORIGINS=https://nadracer-staging.com,https://admin.nadracer.com
+```
+
+### CSP via Environment Variables
+
+Provide comma-separated values (include quotes for tokens like 'self'):
+```env
+CSP_DEFAULT_SRC='self'
+CSP_STYLE_SRC='self','unsafe-inline'
+CSP_SCRIPT_SRC='self','unsafe-inline'
+CSP_SCRIPT_SRC_ELEM='self','unsafe-inline'
+CSP_IMG_SRC='self',data:,https:
+CSP_CONNECT_SRC='self'
 ```
 
 **Default allowed origins:**

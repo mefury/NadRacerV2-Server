@@ -16,7 +16,8 @@ const requiredEnvVars = [
   'PRIVY_APP_ID',
   'MONAD_APP_ID',
   'GAME_ADDRESS',
-  'API_KEY'
+  'API_KEY',
+  'MONAD_RPC_URL'
 ];
 
 // Development mode flag
@@ -294,31 +295,26 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Secure CORS configuration
-// Parse CORS origins from environment variables
+// Parse CORS origins strictly from environment variables (no hardcoded links)
 const getCorsOrigins = () => {
-  const defaultOrigins = [
-    'http://localhost:5173',  // Vite dev server
-    'https://localhost:5173', // Vite dev server (HTTPS)
-    'http://localhost:4173',  // Vite preview server
-    'https://localhost:4173', // Vite preview server (HTTPS)
-  ];
+  const origins = [];
 
-  // Add FRONTEND_URL if provided
+  // Primary frontend URL (single)
   if (process.env.FRONTEND_URL) {
-    defaultOrigins.push(process.env.FRONTEND_URL);
+    origins.push(process.env.FRONTEND_URL);
   }
 
-  // Add CORS_ALLOWED_ORIGINS if provided (comma-separated list)
+  // Additional allowed origins (comma-separated)
   if (process.env.CORS_ALLOWED_ORIGINS) {
-    const additionalOrigins = process.env.CORS_ALLOWED_ORIGINS
+    const additional = process.env.CORS_ALLOWED_ORIGINS
       .split(',')
-      .map(origin => origin.trim())
-      .filter(origin => origin.length > 0);
-    defaultOrigins.push(...additionalOrigins);
+      .map(o => o.trim())
+      .filter(Boolean);
+    origins.push(...additional);
   }
 
-  // Remove duplicates and undefined values
-  return [...new Set(defaultOrigins.filter(Boolean))];
+  // Unique list
+  return [...new Set(origins)];
 };
 
 const allowedOrigins = getCorsOrigins();
@@ -341,17 +337,23 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-monad-app-id', 'x-api-key']
 }));
 
-// Enhanced security headers - relaxed for development
+// Enhanced security headers - all external links are configured via environment variables
+const parseListEnv = (name, fallback = []) => {
+  const raw = process.env[name];
+  if (!raw || !raw.trim()) return fallback;
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+};
+
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"], // For potential CSS
-      scriptSrc: ["'self'", "'unsafe-inline'", "https://auth.privy.io", "https://*.privy.io"], // Allow Privy domains only
-      scriptSrcElem: ["'self'", "'unsafe-inline'", "https://auth.privy.io", "https://*.privy.io"], // Block GTM explicitly
-      imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "https://testnet-rpc.monad.xyz", "https://api.allorigins.win", "https://www.monadclip.fun", "https://*.privy.io"],
-      // Explicitly block GTM domains
+      defaultSrc: parseListEnv('CSP_DEFAULT_SRC', ["'self'"]),
+      styleSrc: parseListEnv('CSP_STYLE_SRC', ["'self'", "'unsafe-inline'"]),
+      scriptSrc: parseListEnv('CSP_SCRIPT_SRC', ["'self'", "'unsafe-inline'"]),
+      scriptSrcElem: parseListEnv('CSP_SCRIPT_SRC_ELEM', ["'self'", "'unsafe-inline'"]),
+      imgSrc: parseListEnv('CSP_IMG_SRC', ["'self'", "data:", "https:"]),
+      connectSrc: parseListEnv('CSP_CONNECT_SRC', ["'self'"]),
+      // Explicitly block GTM script attributes
       scriptSrcAttr: ["'none'"]
     }
   },
@@ -393,9 +395,9 @@ app.use('/api/submit-score', scoreLimiter);
 const LEADERBOARD_CONTRACT = '0xceCBFF203C8B6044F52CE23D914A1bfD997541A4';
 const GAME_ADDRESS = process.env.GAME_ADDRESS; // Will be set after game registration
 
-// API Configuration from environment
-const MONAD_APP_ID = process.env.MONAD_APP_ID || 'cmd8euall0037le0my79qpz42';
-const MONAD_USERNAME_API = process.env.MONAD_USERNAME_API || 'https://www.monadclip.fun';
+// API Configuration from environment (no hardcoded defaults)
+const MONAD_APP_ID = process.env.MONAD_APP_ID;
+const MONAD_USERNAME_API = process.env.MONAD_USERNAME_API;
 
 // Contract ABI
 const LEADERBOARD_ABI = [
@@ -438,18 +440,18 @@ let walletClient;
 
 try {
   // Public client for reading data (free)
-  publicClient = createPublicClient({
+publicClient = createPublicClient({
     chain: monadTestnet,
-    transport: http('https://testnet-rpc.monad.xyz')
+    transport: http(process.env.MONAD_RPC_URL)
   });
 
   // Wallet client for writing data (requires private key)
   if (process.env.PRIVATE_KEY) {
     const account = privateKeyToAccount(process.env.PRIVATE_KEY);
-    walletClient = createWalletClient({
+walletClient = createWalletClient({
       account,
       chain: monadTestnet,
-      transport: http('https://testnet-rpc.monad.xyz')
+      transport: http(process.env.MONAD_RPC_URL)
     });
     console.log('✅ Wallet client initialized for score submissions');
   } else {
@@ -756,7 +758,16 @@ app.get('/api/queue/item/:queueId', (req, res) => {
 app.get('/api/proxy/leaderboard', async (req, res) => {
   try {
     const gameId = req.query.gameId || '21';
-    const apiUrl = `https://www.monadclip.fun/api/leaderboard?gameId=${gameId}`;
+
+    if (!process.env.LEADERBOARD_API_URL) {
+      return res.status(503).json({
+        error: 'Leaderboard proxy not configured',
+        message: 'Please set LEADERBOARD_API_URL in environment variables'
+      });
+    }
+
+    const base = process.env.LEADERBOARD_API_URL.replace(/\/$/, '');
+    const apiUrl = `${base}?gameId=${encodeURIComponent(gameId)}`;
 
     console.log('🔄 Proxying leaderboard request to:', apiUrl);
 
