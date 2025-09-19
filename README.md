@@ -73,8 +73,11 @@ Copy `.env.example` to `.env` and configure the following:
 ```env
 PORT=3001                    # Server port
 NODE_ENV=development         # Environment mode
-FRONTEND_URL=http://localhost:5173  # Client URL for CORS
+FRONTEND_URL=http://localhost:5173  # Primary client URL for CORS
 API_KEY=your_api_key_here    # Client authentication
+
+# CORS Configuration
+CORS_ALLOWED_ORIGINS=https://your-app.dokploy.com,https://your-domain.com
 ```
 
 ### Blockchain & Web3
@@ -133,8 +136,27 @@ Response: { success: true, data: { ... } }
 - **Score Validation**: Advanced anti-cheat algorithms
 - **Session Management**: Secure game session tracking
 - **Input Sanitization**: All inputs validated and sanitized
-- **CORS Protection**: Configured for secure cross-origin requests
+- **Flexible CORS Protection**: Environment-configurable allowed origins
 - **Security Headers**: Helmet middleware for enhanced security
+
+## 🌐 CORS Configuration
+
+The server supports flexible CORS configuration through environment variables:
+
+- **`FRONTEND_URL`**: Primary client URL (e.g., production domain)
+- **`CORS_ALLOWED_ORIGINS`**: Additional allowed origins (comma-separated)
+
+**Example:**
+```env
+FRONTEND_URL=https://nadracer.com
+CORS_ALLOWED_ORIGINS=https://nadracer-staging.com,https://admin.nadracer.com
+```
+
+**Default allowed origins:**
+- `http://localhost:5173` (Vite dev server)
+- `https://localhost:5173` (Vite dev server HTTPS)
+- `http://localhost:4173` (Vite preview server)
+- `https://localhost:4173` (Vite preview server HTTPS)
 
 ## 📊 Anti-Cheat System
 

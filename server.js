@@ -294,13 +294,35 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Secure CORS configuration
-const allowedOrigins = [
-  'http://localhost:5173',  // Vite dev server
-  'https://localhost:5173', // Vite dev server (HTTPS)
-  'http://localhost:4173',  // Vite preview server
-  'https://localhost:4173', // Vite preview server (HTTPS)
-  process.env.FRONTEND_URL  // Production URL
-].filter(Boolean); // Remove any undefined values
+// Parse CORS origins from environment variables
+const getCorsOrigins = () => {
+  const defaultOrigins = [
+    'http://localhost:5173',  // Vite dev server
+    'https://localhost:5173', // Vite dev server (HTTPS)
+    'http://localhost:4173',  // Vite preview server
+    'https://localhost:4173', // Vite preview server (HTTPS)
+  ];
+
+  // Add FRONTEND_URL if provided
+  if (process.env.FRONTEND_URL) {
+    defaultOrigins.push(process.env.FRONTEND_URL);
+  }
+
+  // Add CORS_ALLOWED_ORIGINS if provided (comma-separated list)
+  if (process.env.CORS_ALLOWED_ORIGINS) {
+    const additionalOrigins = process.env.CORS_ALLOWED_ORIGINS
+      .split(',')
+      .map(origin => origin.trim())
+      .filter(origin => origin.length > 0);
+    defaultOrigins.push(...additionalOrigins);
+  }
+
+  // Remove duplicates and undefined values
+  return [...new Set(defaultOrigins.filter(Boolean))];
+};
+
+const allowedOrigins = getCorsOrigins();
+console.log('🔐 CORS allowed origins:', allowedOrigins);
 
 app.use(cors({
   origin: function (origin, callback) {
