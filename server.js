@@ -294,6 +294,10 @@ if (missingVars.length > 0) {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Behind reverse proxies (e.g., Traefik) we need to trust proxy to use X-Forwarded-* headers safely
+// This fixes express-rate-limit warning about X-Forwarded-For when running behind a proxy
+app.set('trust proxy', true);
+
 // Secure CORS configuration
 // Parse CORS origins strictly from environment variables (no hardcoded links)
 const getCorsOrigins = () => {
@@ -343,10 +347,41 @@ app.use(cors({
 }));
 
 // Enhanced security headers - all external links are configured via environment variables
+const sanitizeCspToken = (token) => {
+  const t = token.trim().replace(/^"|"$/g, ''); // strip double quotes if present
+  // Ensure special source expressions are single-quoted as required by Helmet
+  switch (t) {
+    case 'self':
+    case "'self'":
+      return "'self'";
+    case 'none':
+    case "'none'":
+      return "'none'";
+    case 'unsafe-inline':
+    case "'unsafe-inline'":
+      return "'unsafe-inline'";
+    case 'unsafe-eval':
+    case "'unsafe-eval'":
+      return "'unsafe-eval'";
+    case 'strict-dynamic':
+    case "'strict-dynamic'":
+      return "'strict-dynamic'";
+    case 'report-sample':
+    case "'report-sample'":
+      return "'report-sample'";
+    default:
+      return t;
+  }
+};
+
 const parseListEnv = (name, fallback = []) => {
   const raw = process.env[name];
   if (!raw || !raw.trim()) return fallback;
-  return raw.split(',').map(s => s.trim()).filter(Boolean);
+  return raw
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(sanitizeCspToken);
 };
 
 app.use(helmet({
