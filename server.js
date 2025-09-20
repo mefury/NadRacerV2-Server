@@ -294,9 +294,9 @@ if (missingVars.length > 0) {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Behind reverse proxies (e.g., Traefik) we need to trust proxy to use X-Forwarded-* headers safely
-// This fixes express-rate-limit warning about X-Forwarded-For when running behind a proxy
-app.set('trust proxy', true);
+// Behind reverse proxies (e.g., Traefik) trust only the first hop (the proxy)
+// Using a numeric hop count avoids overly-permissive trust that could weaken rate limiting
+app.set('trust proxy', 1);
 
 // Secure CORS configuration
 // Parse CORS origins strictly from environment variables (no hardcoded links)
