@@ -59,7 +59,7 @@ class ScoreSubmissionQueue {
   }
 
   // Add score submission to queue
-  async addSubmission(submission) {
+  async addSubmission(submission, queueIdOverride) {
     return new Promise((resolve, reject) => {
       if (this.queue.length >= this.maxQueueSize) {
         reject(new Error('Queue is full. Please try again later.'));
@@ -67,7 +67,7 @@ class ScoreSubmissionQueue {
       }
 
       const queueItem = {
-        id: `submission_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        id: queueIdOverride || `submission_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         submission,
         timestamp: Date.now(),
         retries: 0,
@@ -325,14 +325,19 @@ app.use(cors({
     // Allow requests with no origin (mobile apps, etc.)
     if (!origin) return callback(null, true);
 
+    // If no allow-list is configured, allow any origin (safe without cookies)
+    if (allowedOrigins.length === 0) {
+      return callback(null, true);
+    }
+
     if (allowedOrigins.includes(origin)) {
-      callback(null, true);
+      return callback(null, true);
     } else {
       console.warn(`🚫 CORS blocked request from: ${origin}`);
-      callback(new Error('Not allowed by CORS'));
+      return callback(new Error('Not allowed by CORS'));
     }
   },
-  credentials: true,
+  credentials: false,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-monad-app-id', 'x-api-key']
 }));
@@ -908,6 +913,9 @@ app.post('/api/submit-score', authenticateApiKey, validateAddress, validateScore
     try {
       console.log(`📋 Adding score submission to queue: ${playerAddress}, Score: ${score}`);
 
+      // Generate a queue ID once and use it consistently
+      const queueId = `submission_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
       // Start processing but don't wait for completion - respond immediately
       scoreQueue.addSubmission({
         playerAddress,
@@ -915,7 +923,7 @@ app.post('/api/submit-score', authenticateApiKey, validateAddress, validateScore
         sessionId,
         authenticatedUser: authenticatedUser.id,
         ip: req.ip
-      }).then((result) => {
+      }, queueId).then((result) => {
         console.log(`📋 Score processed successfully: ${result.queueId}, TX: ${result.transactionHash}`);
       }).catch((error) => {
         console.error('❌ Queue processing error:', error);
@@ -926,7 +934,7 @@ app.post('/api/submit-score', authenticateApiKey, validateAddress, validateScore
       res.json({
         success: true,
         queued: true,
-        queueId: `submission_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        queueId,
         message: 'Score added to submission queue',
         estimatedWaitTime: scoreQueue.queue.length * 2, // Rough estimate in seconds
         queuePosition: scoreQueue.queue.length

@@ -148,17 +148,25 @@ Response: { success: true, data: { ... } }
 - **Flexible CORS Protection**: Environment-configurable allowed origins
 - **Security Headers**: Helmet middleware for enhanced security
 
-## 🌐 CORS & CSP Configuration
+### CORS & CSP Configuration
 
 The server supports flexible CORS configuration through environment variables:
 
-- **`FRONTEND_URL`**: Primary client URL (e.g., production domain)
-- **`CORS_ALLOWED_ORIGINS`**: Additional allowed origins (comma-separated)
+- `FRONTEND_URL`: Primary client URL (e.g., production domain)
+- `CORS_ALLOWED_ORIGINS`: Additional allowed origins (comma-separated)
+- Cookies are not used and CORS credentials are disabled. If both variables are left empty,
+  the server will allow any origin. This is acceptable because authentication uses API keys
+  (headers), not cookies.
 
-**Example:**
+Examples:
 ```env
-FRONTEND_URL=https://nadracer.com
-CORS_ALLOWED_ORIGINS=https://nadracer-staging.com,https://admin.nadracer.com
+# Strict (recommended for prod):
+FRONTEND_URL=https://game.example.com
+CORS_ALLOWED_ORIGINS=https://preview.example.com
+
+# Permissive (ok when no cookies):
+FRONTEND_URL=
+CORS_ALLOWED_ORIGINS=
 ```
 
 ### CSP via Environment Variables
