@@ -56,6 +56,11 @@ class ScoreSubmissionQueue {
     this.processingInterval = 500; // Process every 0.5 seconds for faster testing
     this.maxQueueSize = 100; // Maximum queue size
     this.processingTimer = null;
+    // Ensure we process one item at a time to avoid overlapping submissions
+    this.isWorking = false;
+    // Keep a short-lived record of completed items so clients can fetch final status/tx hash
+    this.completedItems = new Map(); // id -> { id, status: 'completed'|'failed', transactionHash?, timestamp }
+    this.completedRetentionMs = 10 * 60 * 1000; // Retain for 10 minutes
   }
 
   // Add score submission to queue
@@ -110,13 +115,18 @@ class ScoreSubmissionQueue {
 
   // Process next item in queue
   async processNextItem() {
+    // Prevent overlapping processing; handle one item at a time
+    if (this.isWorking) return;
     if (this.queue.length === 0) {
       console.log('📋 Queue empty, stopping processing');
       this.stopProcessing();
       return;
     }
 
+    this.isWorking = true;
     const item = this.queue.shift();
+    item.status = 'processing';
+    this.currentItem = item; // track currently processing item for status visibility
     console.log(`⚙️ Processing queue item: ${item.id}`);
 
     try {
@@ -124,6 +134,15 @@ class ScoreSubmissionQueue {
       item.status = 'completed';
       item.result = submissionResult; // Store the result for access
       console.log(`✅ Queue item ${item.id} completed with TX hash:`, submissionResult?.transactionHash);
+
+      // Save a short-lived record so clients can fetch status after completion
+      this.completedItems.set(item.id, {
+        id: item.id,
+        status: 'completed',
+        transactionHash: submissionResult?.transactionHash,
+        timestamp: Date.now(),
+      });
+
       item.resolve({
         success: true,
         queueId: item.id,
@@ -143,7 +162,20 @@ class ScoreSubmissionQueue {
       } else {
         // Max retries reached, fail permanently
         item.status = 'failed';
+        // Record failure for visibility
+        this.completedItems.set(item.id, {
+          id: item.id,
+          status: 'failed',
+          transactionHash: undefined,
+          timestamp: Date.now(),
+        });
         item.reject(new Error(`Failed to submit score after ${this.maxRetries} attempts: ${error.message}`));
+      }
+    } finally {
+      this.isWorking = false;
+      // Clear current item tracker when done
+      if (this.currentItem && this.currentItem.id === item.id) {
+        this.currentItem = null;
       }
     }
   }
@@ -192,6 +224,8 @@ class ScoreSubmissionQueue {
         args: [playerAddress, BigInt(score), BigInt(1)],
         gas: 200000n,
       });
+      // Expose the tx hash early so clients polling during processing can see it
+      item.result = { ...(item.result || {}), transactionHash: hash };
     } catch (contractError) {
       if (contractError.message && contractError.message.includes('Another transaction has higher priority')) {
         console.log('⚠️ Contract rate limiting detected - this is normal for frequent submissions');
@@ -273,6 +307,13 @@ class ScoreSubmissionQueue {
       }
       return true;
     });
+
+    // Clean up old completed/failed records from the completedItems map
+    for (const [id, meta] of this.completedItems.entries()) {
+      if ((now - meta.timestamp) > this.completedRetentionMs) {
+        this.completedItems.delete(id);
+      }
+    }
   }
 }
 
@@ -769,22 +810,48 @@ app.get('/api/queue/item/:queueId', (req, res) => {
   try {
     const { queueId } = req.params;
 
-    // Find the queue item
+    // Try to find an active queue item first
     const queueItem = scoreQueue.queue.find(item => item.id === queueId);
 
-    if (!queueItem) {
-      return res.status(404).json({
-        error: 'Queue item not found'
+    if (queueItem) {
+      return res.json({
+        success: true,
+        queueId: queueItem.id,
+        status: queueItem.status,
+        transactionHash: queueItem.result?.transactionHash,
+        timestamp: queueItem.timestamp,
+        submittedAt: new Date().toISOString()
       });
     }
 
-    res.json({
-      success: true,
-      queueId: queueItem.id,
-      status: queueItem.status,
-      transactionHash: queueItem.result?.transactionHash,
-      timestamp: queueItem.timestamp,
-      submittedAt: new Date().toISOString()
+    // Check if the item is currently being processed
+    if (scoreQueue.currentItem && scoreQueue.currentItem.id === queueId) {
+      const current = scoreQueue.currentItem;
+      return res.json({
+        success: true,
+        queueId: current.id,
+        status: current.status || 'processing',
+        transactionHash: current.result?.transactionHash,
+        timestamp: current.timestamp,
+        submittedAt: new Date().toISOString()
+      });
+    }
+
+    // If not in active queue, check completed/failed items retention
+    const completed = scoreQueue.completedItems.get(queueId);
+    if (completed) {
+      return res.json({
+        success: true,
+        queueId: completed.id,
+        status: completed.status,
+        transactionHash: completed.transactionHash,
+        timestamp: completed.timestamp,
+        submittedAt: new Date(completed.timestamp).toISOString()
+      });
+    }
+
+    return res.status(404).json({
+      error: 'Queue item not found'
     });
   } catch (error) {
     console.error('❌ Error getting queue item status:', error);
