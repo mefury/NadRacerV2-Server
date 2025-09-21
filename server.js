@@ -3,7 +3,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
-import { createPublicClient, createWalletClient, http, parseEther } from 'viem';
+import crypto from 'crypto';
+import { createPublicClient, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { monadTestnet } from './chains.js';
 
@@ -16,8 +17,8 @@ const requiredEnvVars = [
   'PRIVY_APP_ID',
   'MONAD_APP_ID',
   'GAME_ADDRESS',
-  'API_KEY',
-  'MONAD_RPC_URL'
+  'MONAD_RPC_URL',
+  'SCORE_HMAC_SECRET'
 ];
 
 // Development mode flag
@@ -35,8 +36,31 @@ const MAX_TRANSACTIONS_LIMIT = parseInt(process.env.MAX_TRANSACTIONS_LIMIT) || 1
 const MAX_REASONABLE_SCORE = parseInt(process.env.MAX_REASONABLE_SCORE) || 10000;
 const SUSPICIOUS_SCORE_THRESHOLD = parseInt(process.env.SUSPICIOUS_SCORE_THRESHOLD) || 100000;
 
-// Per-Wallet Rate Limiting
-const WALLET_SUBMISSIONS_PER_HOUR = parseInt(process.env.WALLET_SUBMISSIONS_PER_HOUR) || 20;
+// Session/Nonce Security Settings
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS) || 10 * 60 * 1000; // 10 minutes
+const NONCE_TTL_MS = parseInt(process.env.NONCE_TTL_MS) || 2 * 60 * 1000; // 2 minutes
+const MAX_CLOCK_SKEW_MS = parseInt(process.env.MAX_CLOCK_SKEW_MS) || 2 * 60 * 1000; // 2 minutes
+const MIN_NONCE_INTERVAL_MS = parseInt(process.env.MIN_NONCE_INTERVAL_MS) || 3000; // per session
+const MIN_SUBMIT_INTERVAL_MS = parseInt(process.env.MIN_SUBMIT_INTERVAL_MS) || 3000; // per session
+const QUEUE_BACKPRESSURE_RATIO = parseFloat(process.env.QUEUE_BACKPRESSURE_RATIO) || 0.8;
+const SCORE_HMAC_SECRET = process.env.SCORE_HMAC_SECRET;
+
+// Anti-Spam & Cheating Prevention (High Priority Fixes)
+const MIN_SESSION_DURATION_MS = parseInt(process.env.MIN_SESSION_DURATION_MS) || 15000; // 15 seconds minimum gameplay
+const MIN_TIME_TO_FIRST_COIN_MS = parseInt(process.env.MIN_TIME_TO_FIRST_COIN_MS) || 500; // 0.5 seconds before first coin (reasonable for racing games)
+const MAX_SCORE_PER_SECOND = parseInt(process.env.MAX_SCORE_PER_SECOND) || 10; // max realistic score rate
+const MAX_NONCES_PER_SESSION = parseInt(process.env.MAX_NONCES_PER_SESSION) || 5; // limit nonce requests per session
+const START_GAME_RATE_WINDOW_MS = parseInt(process.env.START_GAME_RATE_WINDOW_MS) || 5 * 60 * 1000; // 5 minute window
+const MAX_START_GAMES_PER_WINDOW = parseInt(process.env.MAX_START_GAMES_PER_WINDOW) || 10; // max game starts per wallet
+const MIN_REALISTIC_COIN_INTERVAL_MS = parseInt(process.env.MIN_REALISTIC_COIN_INTERVAL_MS) || 100; // match client's 100ms timestamp rounding
+const MAX_REALISTIC_COINS_PER_MIN = parseInt(process.env.MAX_REALISTIC_COINS_PER_MIN) || 200; // allow skilled players
+
+// Event-proof validation parameters
+const MIN_COIN_INTERVAL_MS = parseInt(process.env.MIN_COIN_INTERVAL_MS) || 250; // min gap between coin collects
+const MAX_COINS_PER_MIN = parseInt(process.env.MAX_COINS_PER_MIN) || 180; // generous upper bound
+
+// Per-Wallet Rate Limiting (Enhanced for Production)
+const WALLET_SUBMISSIONS_PER_HOUR = parseInt(process.env.WALLET_SUBMISSIONS_PER_HOUR) || (isDevelopment ? 20 : 10);
 const WALLET_RATE_RESET_MS = parseInt(process.env.WALLET_RATE_RESET_MS) || 60 * 60 * 1000; // 1 hour
 
 // Session Management
@@ -44,8 +68,12 @@ const MAX_SESSION_AGE_MS = parseInt(process.env.MAX_SESSION_AGE_MS) || 30 * 60 *
 const SESSION_CLEANUP_AGE_MS = parseInt(process.env.SESSION_CLEANUP_AGE_MS) || 60 * 60 * 1000; // 1 hour
 
 // Game session management for anti-cheat
-const activeGameSessions = new Map(); // sessionId -> { walletAddress, startTime, gameState }
+const activeGameSessions = new Map(); // sessionId -> { walletAddress, startTime, exp, ipHash, uaHash, finalized, lastNonceAt, lastSubmitAt, idempotencyKeys:Set<string>, sessionSalt, nonceCount }
 const recentSubmissions = new Map(); // walletAddress -> { lastSubmission, submissionCount }
+const walletStartGameAttempts = new Map(); // walletAddress -> { attempts: [], lastCleanup }
+
+// One-time nonce store for replay protection
+const nonces = new Map(); // jti -> { sid, walletAddress, exp, used, ipHash, uaHash, createdAt }
 
 // Queue system for score submissions
 class ScoreSubmissionQueue {
@@ -320,10 +348,43 @@ class ScoreSubmissionQueue {
 // Initialize queue system
 const scoreQueue = new ScoreSubmissionQueue();
 
+// Utility helpers (crypto, time, hashing, HMAC)
+const nowMs = () => Date.now();
+const sha256 = (input) => crypto.createHash('sha256').update(String(input)).digest('hex');
+const hmac = (input) => crypto.createHmac('sha256', SCORE_HMAC_SECRET).update(String(input)).digest('hex');
+const ipHashOf = (ip) => sha256(ip || '');
+const uaHashOf = (ua) => sha256(ua || '');
+
+// Canonical messages for wallet signatures
+const startMessage = (wallet, ts) => `nad-racer:start|${wallet.toLowerCase()}|${ts}`;
+const submitMessage = (sid, jti, score, ts) => `nad-racer:submit|${sid}|${jti}|${score}|${ts}`;
+
 // Clean up queue every 5 minutes
 setInterval(() => {
   scoreQueue.cleanup();
 }, 300000);
+
+// Clean up expired nonces and idempotency keys periodically
+setInterval(() => {
+  const now = nowMs();
+  for (const [jti, meta] of nonces.entries()) {
+    if (now > meta.exp + 60 * 1000) { // grace period after expiry
+      nonces.delete(jti);
+    }
+  }
+  for (const [sid, session] of activeGameSessions.entries()) {
+    if (now > (session.exp || 0)) {
+      activeGameSessions.delete(sid);
+      continue;
+    }
+    // prune old idempotency keys (older than session start + TTL window)
+    if (session.idempotencyKeys instanceof Map) {
+      for (const [k, t] of session.idempotencyKeys.entries()) {
+        if (now - t > SESSION_TTL_MS) session.idempotencyKeys.delete(k);
+      }
+    }
+  }
+}, 120000);
 
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingVars.length > 0) {
@@ -334,6 +395,14 @@ if (missingVars.length > 0) {
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Lightweight requestId middleware for correlation (no extra deps)
+app.use((req, res, next) => {
+  const id = (crypto.randomUUID && crypto.randomUUID()) || `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  req.requestId = id;
+  res.setHeader('X-Request-Id', id);
+  next();
+});
 
 // Behind reverse proxies (e.g., Traefik) trust only the first hop (the proxy)
 // Using a numeric hop count avoids overly-permissive trust that could weaken rate limiting
@@ -384,60 +453,13 @@ app.use(cors({
   },
   credentials: false,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-monad-app-id', 'x-api-key']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-monad-app-id']
 }));
 
-// Enhanced security headers - all external links are configured via environment variables
-const sanitizeCspToken = (token) => {
-  const t = token.trim().replace(/^"|"$/g, ''); // strip double quotes if present
-  // Ensure special source expressions are single-quoted as required by Helmet
-  switch (t) {
-    case 'self':
-    case "'self'":
-      return "'self'";
-    case 'none':
-    case "'none'":
-      return "'none'";
-    case 'unsafe-inline':
-    case "'unsafe-inline'":
-      return "'unsafe-inline'";
-    case 'unsafe-eval':
-    case "'unsafe-eval'":
-      return "'unsafe-eval'";
-    case 'strict-dynamic':
-    case "'strict-dynamic'":
-      return "'strict-dynamic'";
-    case 'report-sample':
-    case "'report-sample'":
-      return "'report-sample'";
-    default:
-      return t;
-  }
-};
-
-const parseListEnv = (name, fallback = []) => {
-  const raw = process.env[name];
-  if (!raw || !raw.trim()) return fallback;
-  return raw
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(sanitizeCspToken);
-};
+// Enhanced security headers - CSP disabled for Privy compatibility
 
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: parseListEnv('CSP_DEFAULT_SRC', ["'self'"]),
-      styleSrc: parseListEnv('CSP_STYLE_SRC', ["'self'", "'unsafe-inline'"]),
-      scriptSrc: parseListEnv('CSP_SCRIPT_SRC', ["'self'", "'unsafe-inline'"]),
-      scriptSrcElem: parseListEnv('CSP_SCRIPT_SRC_ELEM', ["'self'", "'unsafe-inline'"]),
-      imgSrc: parseListEnv('CSP_IMG_SRC', ["'self'", "data:", "https:"]),
-      connectSrc: parseListEnv('CSP_CONNECT_SRC', ["'self'"]),
-      // Explicitly block GTM script attributes
-      scriptSrcAttr: ["'none'"]
-    }
-  },
+  contentSecurityPolicy: false, // Disabled for Privy compatibility
   hsts: {
     maxAge: 31536000,
     includeSubDomains: true,
@@ -456,21 +478,39 @@ app.use(express.urlencoded({
   limit: '10kb'
 }));
 
-// Rate limiting
+// Rate limiting - Enhanced for Production
+const generalMaxRequests = isDevelopment ? RATE_LIMIT_GENERAL_MAX : Math.floor(RATE_LIMIT_GENERAL_MAX * 0.7);
 const limiter = rateLimit({
   windowMs: RATE_LIMIT_GENERAL_WINDOW_MS,
-  max: RATE_LIMIT_GENERAL_MAX,
+  max: generalMaxRequests,
   message: 'Too many requests from this IP, please try again later.'
 });
 app.use('/api/', limiter);
 
-// Stricter rate limiting for score submissions
+// Stricter rate limiting for score submissions - Production gets tighter limits
+const scoreMaxRequests = isDevelopment ? RATE_LIMIT_SCORE_MAX : Math.floor(RATE_LIMIT_SCORE_MAX * 0.5);
 const scoreLimiter = rateLimit({
   windowMs: RATE_LIMIT_SCORE_WINDOW_MS,
-  max: RATE_LIMIT_SCORE_MAX,
+  max: scoreMaxRequests,
   message: 'Too many score submissions, please try again later.'
 });
 app.use('/api/submit-score', scoreLimiter);
+
+// Additional rate limiter for start-game endpoint
+const startGameLimiter = rateLimit({
+  windowMs: 2 * 60 * 1000, // 2 minute window
+  max: isDevelopment ? 30 : 15, // tighter in production
+  message: 'Too many game start attempts, please wait.'
+});
+app.use('/api/start-game', startGameLimiter);
+
+// Nonce endpoint rate limiter
+const nonceLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute window
+  max: isDevelopment ? 20 : 10, // much tighter in production
+  message: 'Too many nonce requests, please slow down.'
+});
+app.use('/api/session/:sid/nonce', nonceLimiter);
 
 // Contract configuration
 const LEADERBOARD_CONTRACT = '0xceCBFF203C8B6044F52CE23D914A1bfD997541A4';
@@ -479,6 +519,8 @@ const GAME_ADDRESS = process.env.GAME_ADDRESS; // Will be set after game registr
 // API Configuration from environment (no hardcoded defaults)
 const MONAD_APP_ID = process.env.MONAD_APP_ID;
 const MONAD_USERNAME_API = process.env.MONAD_USERNAME_API;
+const PRIVY_SECRET_KEY = process.env.PRIVY_SECRET_KEY;
+const PRIVY_VERIFY_URL = process.env.PRIVY_VERIFY_URL || 'https://auth.privy.io/api/v1/verify';
 
 // Contract ABI
 const LEADERBOARD_ABI = [
@@ -545,76 +587,60 @@ walletClient = createWalletClient({
   process.exit(1);
 }
 
-// Known players tracking removed - not needed since leaderboard is handled by frontend
-
-// Simple API Key Authentication Middleware (Hobby Project)
-const authenticateApiKey = async (req, res, next) => {
+// Privy auth verification middleware (server-to-server)
+const verifyPrivyAuth = async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization;
-    const apiKey = req.headers['x-api-key'];
+    const isLocalhost = (req.hostname === 'localhost' || req.hostname === '127.0.0.1' || req.ip === '::1');
+    const authHeader = req.headers.authorization || '';
 
-    // Check for API key in header or authorization
-    let providedKey = apiKey;
-
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      // Support both API key and token formats
-      providedKey = authHeader.substring(7);
-    }
-
-    if (!providedKey) {
-      console.log('❌ No API key provided');
-      return res.status(401).json({
-        error: 'Authentication required',
-        message: 'Missing API key'
-      });
-    }
-
-    // Validate API key
-    if (providedKey !== process.env.API_KEY) {
-      console.log('❌ Invalid API key provided');
-      return res.status(401).json({
-        error: 'Authentication failed',
-        message: 'Invalid API key'
-      });
-    }
-
-    // DEVELOPMENT MODE: Create mock user for testing
-    if (isDevelopment) {
-      console.log('⚠️ DEVELOPMENT MODE: Using mock user authentication');
-
-      req.user = {
-        id: 'dev-user-123',
-        email: 'dev@example.com',
-        monadWalletAddress: null, // Will be validated from request body
-        linkedAccounts: [],
-        isDevelopment: true
-      };
-
-      console.log('✅ [DEV AUTH] Development authentication successful');
+    // Unconditional dev/localhost bypass: never require bearer token in dev/local
+    if (isDevelopment || isLocalhost) {
+      const player = (req.body?.playerAddress || req.params?.playerAddress || '').toLowerCase();
+      req.auth = { userId: isDevelopment ? 'dev' : 'dev-local', walletAddress: player };
       return next();
     }
 
-    // PRODUCTION MODE: Basic authentication successful
-    console.log('✅ [AUTH] API key authentication successful');
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Missing bearer token' });
+    }
+    const token = authHeader.slice(7);
 
-    // For production, we'll validate wallet from request body
-    // This provides basic protection while keeping it simple
-    req.user = {
-      id: 'authenticated-user',
-      email: 'user@example.com',
-      monadWalletAddress: null, // Will be set from request validation
-      linkedAccounts: [],
-      isAuthenticated: true
-    };
+    if (!PRIVY_SECRET_KEY) {
+      return res.status(500).json({ error: 'Server auth not configured' });
+    }
 
-    next();
-
-  } catch (error) {
-    console.error('❌ Authentication error:', error.message);
-    return res.status(401).json({
-      error: 'Authentication failed',
-      message: 'Authentication error'
+    const response = await fetch(PRIVY_VERIFY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${PRIVY_SECRET_KEY}`
+      },
+      body: JSON.stringify({ token })
     });
+
+    if (!response.ok) {
+      const txt = await response.text();
+      console.warn(`[${req.requestId}] Privy verify failed: ${response.status} ${txt}`);
+      return res.status(401).json({ error: 'Invalid auth token' });
+    }
+
+    const data = await response.json();
+    // Flexible extraction of wallet address from Privy payloads
+    let walletAddress = (data.user?.walletAddress || data.user?.wallet?.address || data.wallet?.address || '').toLowerCase();
+    if (!walletAddress && Array.isArray(data.user?.linked_accounts)) {
+      const eth = data.user.linked_accounts.find(a => (a.type || '').toLowerCase().includes('ethereum'));
+      if (eth?.address) walletAddress = String(eth.address).toLowerCase();
+    }
+
+    if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      return res.status(401).json({ error: 'Authenticated wallet not found' });
+    }
+
+    req.auth = { userId: data.user?.id || 'unknown', walletAddress };
+    next();
+  } catch (err) {
+    console.error(`[${req.requestId}] Privy auth error:`, err?.message || err);
+    return res.status(401).json({ error: 'Auth verification failed' });
   }
 };
 
@@ -699,48 +725,80 @@ app.get('/api/health', (req, res) => {
 });
 
 // Start game session (anti-cheat protection)
-app.post('/api/start-game', authenticateApiKey, (req, res) => {
+app.post('/api/start-game', verifyPrivyAuth, async (req, res) => {
   try {
-    const { playerAddress } = req.body;
-
-    if (!playerAddress || !/^0x[a-fA-F0-9]{40}$/.test(playerAddress)) {
-      return res.status(400).json({
-        error: 'Invalid player address format'
-      });
+    const { playerAddress } = req.body || {};
+    const player = (playerAddress || '').toLowerCase();
+    if (!player || !/^0x[a-fA-F0-9]{40}$/.test(player)) {
+      return res.status(400).json({ error: 'Invalid player address format' });
     }
 
-    // Generate session token
-    const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const sessionData = {
-      playerAddress: playerAddress.toLowerCase(),
-      startTime: Date.now(),
-      gameState: 'active',
-      ip: req.ip
-    };
+    // Bind to authenticated wallet
+    if (!isDevelopment && req.auth?.walletAddress !== player) {
+      return res.status(403).json({ error: 'Auth wallet mismatch' });
+    }
 
-    // Store session
+    // Per-wallet start-game rate limiting (HIGH PRIORITY FIX #5)
+    const now = nowMs();
+    const walletAttempts = walletStartGameAttempts.get(player) || { attempts: [], lastCleanup: now };
+    
+    // Clean old attempts outside the window
+    if (now - walletAttempts.lastCleanup > START_GAME_RATE_WINDOW_MS) {
+      walletAttempts.attempts = walletAttempts.attempts.filter(t => now - t < START_GAME_RATE_WINDOW_MS);
+      walletAttempts.lastCleanup = now;
+    }
+    
+    // Check if wallet exceeds start-game rate limit
+    if (walletAttempts.attempts.length >= MAX_START_GAMES_PER_WINDOW) {
+      return res.status(429).json({ 
+        error: 'Start-game rate limit exceeded', 
+        message: `Too many game sessions started. Please wait before starting a new game.`,
+        retryAfter: Math.ceil((walletAttempts.attempts[0] + START_GAME_RATE_WINDOW_MS - now) / 1000)
+      });
+    }
+    
+    // Record this attempt
+    walletAttempts.attempts.push(now);
+    walletStartGameAttempts.set(player, walletAttempts);
+
+// Generate session id and bind context
+const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+const ipHash = ipHashOf(req.ip);
+const uaHash = uaHashOf(req.headers['user-agent'] || '');
+const startTime = nowMs();
+const exp = startTime + SESSION_TTL_MS;
+const sessionSalt = crypto.randomBytes(16).toString('hex'); // 32-hex chars
+
+const sessionData = {
+  playerAddress: player,
+  startTime,
+  exp,
+  gameState: 'active',
+  ipHash,
+  uaHash,
+  finalized: false,
+  lastNonceAt: 0,
+  lastSubmitAt: 0,
+  idempotencyKeys: new Map(), // key -> ts
+  sessionSalt,
+  nonceCount: 0, // HIGH PRIORITY FIX #6: Track nonce requests
+};
+
     activeGameSessions.set(sessionId, sessionData);
 
-    // Clean up old sessions
+    // Clean up expired sessions opportunistically
     for (const [id, session] of activeGameSessions.entries()) {
-      if (Date.now() - session.startTime > SESSION_CLEANUP_AGE_MS) {
+      if (nowMs() > (session.exp || 0)) {
         activeGameSessions.delete(id);
       }
     }
 
-    console.log(`🎮 Game session started: ${sessionId} for ${playerAddress}`);
+console.log(`[${req.requestId}] 🎮 Game session started: ${sessionId} for ${player}`);
 
-    res.json({
-      success: true,
-      sessionId,
-      message: 'Game session started'
-    });
-
+res.json({ success: true, sessionId, sessionSalt, message: 'Game session started', requestId: req.requestId });
   } catch (error) {
     console.error('❌ Error starting game session:', error);
-    res.status(500).json({
-      error: 'Failed to start game session'
-    });
+    res.status(500).json({ error: 'Failed to start game session' });
   }
 });
 
@@ -785,6 +843,58 @@ app.get('/api/player/:playerAddress', validateAddress, async (req, res) => {
     res.status(500).json({
       error: 'Failed to fetch player data'
     });
+  }
+});
+
+// Nonce minting endpoint (one-time, short-lived)
+app.post('/api/session/:sid/nonce', verifyPrivyAuth, (req, res) => {
+  try {
+    const { sid } = req.params;
+    const session = activeGameSessions.get(sid);
+    if (!session) return res.status(400).json({ error: 'Invalid or expired session' });
+    if (session.finalized) return res.status(400).json({ error: 'Session finalized' });
+    if (nowMs() > session.exp) {
+      activeGameSessions.delete(sid);
+      return res.status(400).json({ error: 'Session expired' });
+    }
+
+    // Context binding check
+    const ipHash = ipHashOf(req.ip);
+    const uaHash = uaHashOf(req.headers['user-agent'] || '');
+    if (ipHash !== session.ipHash || uaHash !== session.uaHash) {
+      return res.status(403).json({ error: 'Session context mismatch' });
+    }
+
+    // Per-session nonce pacing and count limiting (HIGH PRIORITY FIX #6)
+    const now = nowMs();
+    if (now - (session.lastNonceAt || 0) < MIN_NONCE_INTERVAL_MS) {
+      return res.status(429).json({ error: 'Too many nonce requests' });
+    }
+    
+    // Nonce count limit per session
+    if ((session.nonceCount || 0) >= MAX_NONCES_PER_SESSION) {
+      return res.status(429).json({ 
+        error: 'Session nonce limit exceeded',
+        message: 'Too many nonce requests for this session'
+      });
+    }
+    
+    session.lastNonceAt = now;
+    session.nonceCount = (session.nonceCount || 0) + 1;
+
+    // Mint jti and tokenSig
+    const jti = `jti_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const exp = now + NONCE_TTL_MS;
+    const payload = `${sid}|${session.playerAddress}|${jti}|${exp}|${session.ipHash}|${session.uaHash}`;
+    const tokenSig = hmac(payload);
+
+    nonces.set(jti, { sid, walletAddress: session.playerAddress, exp, used: false, ipHash: session.ipHash, uaHash: session.uaHash, createdAt: now });
+
+console.log(`[${req.requestId}] 🔐 Nonce minted for ${session.playerAddress}: ${jti}`);
+return res.json({ success: true, jti, exp, tokenSig, requestId: req.requestId });
+  } catch (error) {
+    console.error('❌ Nonce endpoint error:', error);
+    return res.status(500).json({ error: 'Failed to mint nonce' });
   }
 });
 
@@ -911,179 +1021,241 @@ app.get('/api/proxy/leaderboard', async (req, res) => {
 
 // Submit player score (requires authentication and validation)
 // Now uses queue system for reliable processing
-app.post('/api/submit-score', authenticateApiKey, validateAddress, validateScoreSubmission, async (req, res) => {
+app.post('/api/submit-score', verifyPrivyAuth, validateAddress, validateScoreSubmission, async (req, res) => {
   try {
-    const { playerAddress, score, sessionId } = req.body;
-    const authenticatedUser = req.user;
+    const { playerAddress, score, sessionId: sid, jti, tokenSig, walletSignature, clientTs, idempotencyKey, proof } = req.body || {};
+    const player = (playerAddress || '').toLowerCase();
 
-    // ANTI-CHEAT: Validate session token
-    if (!sessionId) {
-      console.log('🚫 Missing session token');
-      return res.status(400).json({
-        error: 'Session validation failed',
-        message: 'Missing game session token'
+    // Session checks
+    if (!sid) return res.status(400).json({ error: 'Missing sessionId' });
+    const session = activeGameSessions.get(sid);
+    if (!session) return res.status(400).json({ error: 'Invalid or expired game session' });
+    if (session.finalized) return res.status(400).json({ error: 'Session finalized' });
+    if (nowMs() > session.exp) {
+      activeGameSessions.delete(sid);
+      return res.status(400).json({ error: 'Session expired' });
+    }
+    
+    // HIGH PRIORITY FIX #1: Minimum session duration check
+    const sessionDuration = nowMs() - session.startTime;
+    if (sessionDuration < MIN_SESSION_DURATION_MS) {
+      return res.status(400).json({ 
+        error: 'Session too short',
+        message: `Minimum gameplay duration is ${MIN_SESSION_DURATION_MS / 1000} seconds`,
+        required: Math.ceil((MIN_SESSION_DURATION_MS - sessionDuration) / 1000)
       });
     }
 
-    const session = activeGameSessions.get(sessionId);
-    if (!session) {
-      console.log(`🚫 Invalid session token: ${sessionId}`);
-      return res.status(400).json({
-        error: 'Session validation failed',
-        message: 'Invalid or expired game session'
-      });
+    // Context binding
+    const ipHash = ipHashOf(req.ip);
+    const uaHash = uaHashOf(req.headers['user-agent'] || '');
+    if (ipHash !== session.ipHash || uaHash !== session.uaHash) {
+      return res.status(403).json({ error: 'Session context mismatch' });
     }
 
-    // ANTI-CHEAT: Validate session belongs to player
-    if (session.playerAddress !== playerAddress.toLowerCase()) {
-      console.log(`🚫 Session wallet mismatch: ${session.playerAddress} vs ${playerAddress}`);
-      return res.status(403).json({
-        error: 'Session validation failed',
-        message: 'Session does not match player address'
-      });
+    // Wallet binding
+    if (session.playerAddress !== player) {
+      return res.status(403).json({ error: 'Session wallet mismatch' });
     }
 
-    // ANTI-CHEAT: Check session age
-    const sessionAge = Date.now() - session.startTime;
-    if (sessionAge > MAX_SESSION_AGE_MS) {
-      activeGameSessions.delete(sessionId);
-      console.log(`😫 Session expired: ${sessionId}`);
-      return res.status(400).json({
-        error: 'Session validation failed',
-        message: 'Game session has expired'
-      });
+    // Per-session submit pacing
+    const now = nowMs();
+    if (now - (session.lastSubmitAt || 0) < MIN_SUBMIT_INTERVAL_MS) {
+      return res.status(429).json({ error: 'Too many submissions' });
     }
 
-    // ANTI-CHEAT: Rate limiting per wallet
-    const walletKey = playerAddress.toLowerCase();
-    const now = Date.now();
-    const walletData = recentSubmissions.get(walletKey) || { lastSubmission: 0, submissionCount: 0 };
+    // Nonce validation (single use)
+    if (!jti || !tokenSig) return res.status(400).json({ error: 'Missing nonce' });
+    const nonce = nonces.get(jti);
+    if (!nonce) return res.status(400).json({ error: 'Invalid or expired nonce' });
+    if (nonce.used) return res.status(401).json({ error: 'Nonce already used' });
+    if (nonce.sid !== sid || nonce.walletAddress !== player) return res.status(403).json({ error: 'Nonce/session mismatch' });
+    if (now > nonce.exp) {
+      nonces.delete(jti);
+      return res.status(400).json({ error: 'Nonce expired' });
+    }
+    if (nonce.ipHash !== session.ipHash || nonce.uaHash !== session.uaHash) {
+      return res.status(403).json({ error: 'Nonce context mismatch' });
+    }
+    // Verify HMAC over canonical payload
+    const expected = hmac(`${sid}|${player}|${jti}|${nonce.exp}|${session.ipHash}|${session.uaHash}`);
+    if (expected !== tokenSig) return res.status(401).json({ error: 'Invalid nonce signature' });
 
-    // Reset counter based on configured time window
-    if (now - walletData.lastSubmission > WALLET_RATE_RESET_MS) {
-      walletData.submissionCount = 0;
+    // Timestamp sanity for submit message
+    const ts = Number(clientTs);
+    if (!Number.isFinite(ts) || Math.abs(now - ts) > MAX_CLOCK_SKEW_MS) {
+      return res.status(400).json({ error: 'Invalid or skewed timestamp' });
     }
 
-    // Check wallet submission rate limit
+// Bind to authenticated wallet
+    if (!isDevelopment && req.auth?.walletAddress !== player) {
+      return res.status(403).json({ error: 'Auth wallet mismatch' });
+    }
+
+    // Idempotency: simple per-session memory (optional; nonce already ensures single processing)
+    const idemKey = String(idempotencyKey || '');
+    if (idemKey) {
+      if (session.idempotencyKeys.has(idemKey)) {
+        return res.status(200).json({ success: true, queued: true, duplicate: true });
+      }
+      session.idempotencyKeys.set(idemKey, now);
+    }
+
+    // Wallet global rate limiting (existing logic retained)
+    const walletData = recentSubmissions.get(player) || { lastSubmission: 0, submissionCount: 0 };
+    if (now - walletData.lastSubmission > WALLET_RATE_RESET_MS) walletData.submissionCount = 0;
     if (walletData.submissionCount >= WALLET_SUBMISSIONS_PER_HOUR) {
-      console.log(`🚫 Rate limit exceeded for wallet: ${walletKey}`);
-      return res.status(429).json({
-        error: 'Rate limit exceeded',
-        message: 'Too many score submissions. Please wait before submitting again.'
-      });
+      return res.status(429).json({ error: 'Rate limit exceeded', message: 'Too many score submissions. Please wait before submitting again.' });
     }
-
-    // Update submission tracking
     walletData.lastSubmission = now;
     walletData.submissionCount++;
-    recentSubmissions.set(walletKey, walletData);
+    recentSubmissions.set(player, walletData);
 
-    // ANTI-CHEAT: Validate score is reasonable (not suspiciously high)
-    if (score > MAX_REASONABLE_SCORE) {
-      console.log(`😫 Suspiciously high score: ${score} from ${playerAddress}`);
-      return res.status(400).json({
-        error: 'Score validation failed',
-        message: 'Score appears to be invalid'
+// HIGH PRIORITY FIX #4: Duration-bound max score validation
+const sessionDurationMs = nowMs() - session.startTime;
+const sessionDurationSec = Math.max(sessionDurationMs / 1000, 1); // at least 1 second
+const maxScoreForDuration = Math.floor(sessionDurationSec * MAX_SCORE_PER_SECOND);
+
+if (score > maxScoreForDuration) {
+  return res.status(400).json({ 
+    error: 'Score exceeds time-based limit',
+    message: `Score ${score} is too high for ${sessionDurationSec.toFixed(1)}s gameplay (max: ${maxScoreForDuration})`
+  });
+}
+
+// Reasonable score check (keep, plus time-normalized soft gate)
+if (score > MAX_REASONABLE_SCORE) {
+  return res.status(400).json({ error: 'Score validation failed', message: 'Score appears to be invalid' });
+}
+
+// Proof-of-play validation (coin events)
+if (score > 0) {
+  if (!proof || !Array.isArray(proof.timestamps) || typeof proof.digest !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid gameplay proof' });
+  }
+  const tsArr = proof.timestamps;
+  // Basic checks
+  if (tsArr.length !== score) {
+    return res.status(400).json({ error: 'Proof mismatch: count differs from score' });
+  }
+  
+  // HIGH PRIORITY FIX #2: Minimum time to first coin check
+  if (tsArr.length > 0) {
+    const firstCoinDelay = tsArr[0] - session.startTime;
+    if (firstCoinDelay < MIN_TIME_TO_FIRST_COIN_MS) {
+      return res.status(400).json({ 
+        error: 'First coin collected too quickly',
+        message: `Minimum delay to first coin is ${MIN_TIME_TO_FIRST_COIN_MS / 1000} seconds`
       });
     }
-
-    // CRITICAL SECURITY CHECK: Verify the wallet address matches authenticated user
-    if (!isDevelopment && playerAddress.toLowerCase() !== authenticatedUser.monadWalletAddress) {
-      console.log(`🚫 WALLET MISMATCH: Request wallet ${playerAddress}, Auth wallet ${authenticatedUser.monadWalletAddress}`);
-      return res.status(403).json({
-        error: 'Wallet address mismatch',
-        message: 'The provided wallet address does not match the authenticated user'
+  }
+  
+  // HIGH PRIORITY FIX #3: Tightened coin timing constraints
+  let last = 0;
+  for (let i = 0; i < tsArr.length; i++) {
+    const t = Number(tsArr[i]);
+    if (!Number.isFinite(t)) return res.status(400).json({ error: 'Invalid timestamp in proof' });
+    if (i === 0) {
+      last = t;
+      continue;
+    }
+    const gap = t - last;
+    if (gap < 0) {
+      return res.status(400).json({ 
+        error: 'Invalid timestamp order',
+        message: 'Coin collection timestamps must be in chronological order'
       });
     }
+    // Allow identical timestamps (due to client's 100ms rounding) but not negative gaps
+    if (gap > 0 && gap < MIN_REALISTIC_COIN_INTERVAL_MS) {
+      return res.status(400).json({ 
+        error: 'Unrealistic coin collection timing',
+        message: `Minimum interval between coins is ${MIN_REALISTIC_COIN_INTERVAL_MS}ms (gap was ${gap}ms)`
+      });
+    }
+    last = t;
+  }
+  // HIGH PRIORITY FIX #3: Tightened coins per minute cap
+  const durationMs = (tsArr[tsArr.length - 1] - tsArr[0]) || 1;
+  const perMin = (tsArr.length * 60000) / Math.max(durationMs, 1);
+  if (perMin > MAX_REALISTIC_COINS_PER_MIN) {
+    return res.status(400).json({ 
+      error: 'Unrealistic coin collection rate',
+      message: `Rate of ${perMin.toFixed(1)} coins/min exceeds limit of ${MAX_REALISTIC_COINS_PER_MIN}`
+    });
+  }
+  // Session window alignment
+  if (tsArr[0] < session.startTime - MAX_CLOCK_SKEW_MS || tsArr[tsArr.length - 1] > now + MAX_CLOCK_SKEW_MS) {
+    return res.status(400).json({ error: 'Proof invalid: timestamps out of session bounds' });
+  }
+  // Canonical digest recomputation: sid|salt|coin|t1,t2,...
+  const salt = session.sessionSalt || '';
+  const digestInput = `${sid}|${salt}|coin|${tsArr.join(',')}`;
+  const expectedDigest = sha256(digestInput);
+  if (expectedDigest !== proof.digest) {
+    return res.status(400).json({ error: 'Proof invalid: digest mismatch' });
+  }
+}
 
-    // DEVELOPMENT MODE: Set wallet address from request for testing
-    if (isDevelopment && !authenticatedUser.monadWalletAddress) {
-      authenticatedUser.monadWalletAddress = playerAddress.toLowerCase();
-      console.log(`⚠️ DEVELOPMENT MODE: Using wallet from request: ${playerAddress}`);
+    // Queue backpressure
+    const threshold = Math.floor(scoreQueue.maxQueueSize * QUEUE_BACKPRESSURE_RATIO);
+    if (scoreQueue.queue.length >= threshold) {
+      return res.status(503).json({ error: 'Service temporarily unavailable', message: 'Submission queue is busy. Please try again shortly.' });
     }
 
-    console.log(`✅ Wallet verification passed for user ${authenticatedUser.id}`);
-    console.log(`🎯 [SCORE_SUBMIT] User: ${authenticatedUser.id}, Wallet: ${playerAddress}, Score: ${score}, IP: ${req.ip}`);
+    // Mark nonce used atomically (before enqueue)
+    nonce.used = true;
+    nonces.set(jti, nonce);
+    session.lastSubmitAt = now;
 
-    console.log('🎯 ===== SCORE SUBMISSION RECEIVED =====');
-    console.log('🎯 Player Address:', playerAddress);
-    console.log('🎯 Score:', score);
-    console.log('🎯 Request Body:', req.body);
-    console.log('🎯 Request Headers:', req.headers);
-
-    // Add to queue instead of processing immediately
-    try {
-      console.log(`📋 Adding score submission to queue: ${playerAddress}, Score: ${score}`);
-
-      // Generate a queue ID once and use it consistently
+    // Enqueue submission
+try {
       const queueId = `submission_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-      // Start processing but don't wait for completion - respond immediately
-      scoreQueue.addSubmission({
-        playerAddress,
-        score,
-        sessionId,
-        authenticatedUser: authenticatedUser.id,
-        ip: req.ip
-      }, queueId).then((result) => {
-        console.log(`📋 Score processed successfully: ${result.queueId}, TX: ${result.transactionHash}`);
-      }).catch((error) => {
-        console.error('❌ Queue processing error:', error);
-      });
-
-      console.log(`📋 Score queued successfully, Queue size: ${scoreQueue.queue.length}`);
-
-      res.json({
-        success: true,
-        queued: true,
-        queueId,
-        message: 'Score added to submission queue',
-        estimatedWaitTime: scoreQueue.queue.length * 2, // Rough estimate in seconds
-        queuePosition: scoreQueue.queue.length
-      });
-
-    } catch (queueError) {
-      console.error('❌ Failed to queue score submission:', queueError.message);
-      console.error('❌ Queue error details:', queueError);
-
-      if (queueError.message.includes('Queue is full')) {
-        return res.status(503).json({
-          error: 'Service temporarily unavailable',
-          message: 'Submission queue is full. Please try again later.'
+      console.log(`[${req.requestId}] 🎯 SCORE_SUBMIT received: wallet=${player}, score=${score}, sid=${sid}, jti=${jti}`);
+      scoreQueue.addSubmission({ playerAddress: player, score, sessionId: sid, ip: req.ip }, queueId)
+        .then((result) => {
+          console.log(`[${req.requestId}] 📋 Score processed: ${result.queueId}, TX: ${result.transactionHash}`);
+        }).catch((error) => {
+          console.error(`[${req.requestId}] ❌ Queue processing error:`, error);
         });
+
+      // Finalize session after successful queueing (single-submit sessions)
+      session.finalized = true;
+      activeGameSessions.set(sid, session);
+      // Purge any outstanding nonces tied to this session to prevent reuse
+      for (const [njti, meta] of nonces.entries()) {
+        if (meta.sid === sid) nonces.delete(njti);
       }
 
-      return res.status(500).json({
-        error: 'Failed to queue score submission',
-        message: queueError.message
-      });
+      return res.json({ success: true, queued: true, queueId, message: 'Score added to submission queue', requestId: req.requestId });
+    } catch (queueError) {
+      console.error('❌ Failed to queue score submission:', queueError);
+      return res.status(500).json({ error: 'Failed to queue score submission', message: queueError.message });
     }
-
   } catch (error) {
     console.error('Error processing score submission:', error);
-
-    res.status(500).json({
-      error: 'Failed to process score submission',
-      details: error.message
-    });
+    return res.status(500).json({ error: 'Failed to process score submission', details: error.message });
   }
 });
 
-// Leaderboard functionality removed - handled by frontend using Monad API directly
+// Leaderboard functionality: frontend uses server proxy to Monad API
 
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
+  const rid = req?.requestId || 'n/a';
+  console.error(`[${rid}] Unhandled error:`, error);
   res.status(500).json({
-    error: 'Internal server error'
+    error: 'Internal server error',
+    requestId: rid
   });
 });
 
 // 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({
-    error: 'Endpoint not found'
+    error: 'Endpoint not found',
+    requestId: req.requestId
   });
 });
 
