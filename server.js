@@ -12,6 +12,16 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 // Load environment variables
 dotenv.config();
 
+// Polyfill crypto for Node.js compatibility with jose library
+if (!globalThis.crypto) {
+  if (!crypto.webcrypto) {
+    console.error('❌ Node.js version does not support webcrypto. Please upgrade to Node.js 16+ for JWT authentication.');
+    process.exit(1);
+  }
+  globalThis.crypto = crypto.webcrypto;
+  console.log('✅ Crypto polyfill applied for jose library compatibility');
+}
+
 // Validate required environment variables
 const requiredEnvVars = [
   'PRIVATE_KEY',
