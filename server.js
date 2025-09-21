@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import { createPublicClient, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { monadTestnet } from './chains.js';
+import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // Load environment variables
 dotenv.config();
@@ -519,8 +520,7 @@ const GAME_ADDRESS = process.env.GAME_ADDRESS; // Will be set after game registr
 // API Configuration from environment (no hardcoded defaults)
 const MONAD_APP_ID = process.env.MONAD_APP_ID;
 const MONAD_USERNAME_API = process.env.MONAD_USERNAME_API;
-const PRIVY_SECRET_KEY = process.env.PRIVY_SECRET_KEY;
-const PRIVY_VERIFY_URL = process.env.PRIVY_VERIFY_URL || 'https://auth.privy.io/api/v1/verify';
+const PRIVY_SECRET_KEY = process.env.PRIVY_SECRET_KEY; // Not needed for JWT verification but kept for compatibility
 
 // Contract ABI
 const LEADERBOARD_ABI = [
@@ -587,8 +587,78 @@ walletClient = createWalletClient({
   process.exit(1);
 }
 
-// Privy auth verification middleware (server-to-server)
+// Privy JWT verification using jose library with JWKS
+const JWKS_CACHE_TTL = 3600000; // 1 hour
+let privyJWKSet = null;
+let jwksSetTime = 0;
+
+// Create or get cached JWKS for Privy with enhanced logging
+const getPrivyJWKSet = () => {
+  const now = Date.now();
+  
+  // Return cached JWKS if still valid
+  if (privyJWKSet && (now - jwksSetTime) < JWKS_CACHE_TTL) {
+    const remainingMinutes = Math.floor((JWKS_CACHE_TTL - (now - jwksSetTime)) / 60000);
+    console.log(`🔑 Using cached JWKS (valid for ${remainingMinutes} more minutes)`);
+    return privyJWKSet;
+  }
+  
+  // Create new remote JWKS
+  const jwksUrl = `https://auth.privy.io/api/v1/apps/${process.env.PRIVY_APP_ID}/jwks.json`;
+  console.log(`🔑 Creating fresh JWKS set from: ${jwksUrl}`);
+  privyJWKSet = createRemoteJWKSet(new URL(jwksUrl));
+  jwksSetTime = now;
+  console.log(`🔑 ✅ JWKS cached until: ${new Date(now + JWKS_CACHE_TTL).toISOString()}`);
+  
+  return privyJWKSet;
+};
+
+// Complete JWT verification with cryptographic signature validation and comprehensive logging
+const verifyPrivyJWT = async (token) => {
+  try {
+    console.log('🔐 Starting JWT verification process');
+    const jwks = getPrivyJWKSet();
+    
+    // Log token structure for debugging (first few chars only)
+    console.log('🔐 Token preview:', token.substring(0, 20) + '...' + token.slice(-20));
+    
+    // Verify JWT with full cryptographic validation
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer: 'privy.io',
+      audience: process.env.PRIVY_APP_ID,
+      // Clock tolerance for slight time differences
+      clockTolerance: 30 // 30 seconds
+    });
+    
+    console.log('🔐 ✅ JWT verification successful');
+    return payload;
+  } catch (error) {
+    console.error('🔐 ❌ JWT verification failed:', {
+      code: error.code,
+      message: error.message,
+      claim: error.claim,
+      reason: error.reason
+    });
+    
+    // Enhanced error messages for debugging
+    if (error.code === 'ERR_JWT_EXPIRED') {
+      throw new Error('Access token has expired');
+    } else if (error.code === 'ERR_JWS_SIGNATURE_VERIFICATION_FAILED') {
+      throw new Error('Invalid token signature');
+    } else if (error.code === 'ERR_JWT_CLAIM_VALIDATION_FAILED') {
+      throw new Error(`Token claim validation failed: ${error.claim || 'unknown'} - ${error.reason || error.message}`);
+    } else if (error.code === 'ERR_JWKS_NO_MATCHING_KEY') {
+      throw new Error('No matching key found in JWKS for token verification');
+    } else {
+      throw new Error(`JWT verification failed: ${error.message}`);
+    }
+  }
+};
+
+// Enhanced Privy auth verification middleware with comprehensive JWT validation
 const verifyPrivyAuth = async (req, res, next) => {
+  const startTime = Date.now();
+  
   try {
     const isLocalhost = (req.hostname === 'localhost' || req.hostname === '127.0.0.1' || req.ip === '::1');
     const authHeader = req.headers.authorization || '';
@@ -597,50 +667,78 @@ const verifyPrivyAuth = async (req, res, next) => {
     if (isDevelopment || isLocalhost) {
       const player = (req.body?.playerAddress || req.params?.playerAddress || '').toLowerCase();
       req.auth = { userId: isDevelopment ? 'dev' : 'dev-local', walletAddress: player };
+      console.log(`[${req.requestId}] 🔓 Dev/localhost auth bypass for: ${player}`);
       return next();
     }
 
     if (!authHeader.startsWith('Bearer ')) {
+      console.warn(`[${req.requestId}] 🚫 Missing bearer token from ${req.ip}`);
       return res.status(401).json({ error: 'Missing bearer token' });
     }
     const token = authHeader.slice(7);
 
-    if (!PRIVY_SECRET_KEY) {
-      return res.status(500).json({ error: 'Server auth not configured' });
+    if (!process.env.PRIVY_APP_ID) {
+      console.error(`[${req.requestId}] ❌ Privy app ID not configured`);
+      return res.status(500).json({ error: 'Privy app ID not configured' });
     }
 
-    const response = await fetch(PRIVY_VERIFY_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${PRIVY_SECRET_KEY}`
-      },
-      body: JSON.stringify({ token })
-    });
+    console.log(`[${req.requestId}] 🔐 Verifying JWT token for app: ${process.env.PRIVY_APP_ID}`);
 
-    if (!response.ok) {
-      const txt = await response.text();
-      console.warn(`[${req.requestId}] Privy verify failed: ${response.status} ${txt}`);
-      return res.status(401).json({ error: 'Invalid auth token' });
+    // Verify JWT with complete cryptographic validation
+    const payload = await verifyPrivyJWT(token);
+    
+    // Extract wallet address from JWT payload with enhanced logging
+    let walletAddress = '';
+    
+    // Debug: Log the full payload structure (remove in production)
+    if (isDevelopment) {
+      console.log(`[${req.requestId}] 🐛 JWT payload keys:`, Object.keys(payload));
     }
-
-    const data = await response.json();
-    // Flexible extraction of wallet address from Privy payloads
-    let walletAddress = (data.user?.walletAddress || data.user?.wallet?.address || data.wallet?.address || '').toLowerCase();
-    if (!walletAddress && Array.isArray(data.user?.linked_accounts)) {
-      const eth = data.user.linked_accounts.find(a => (a.type || '').toLowerCase().includes('ethereum'));
-      if (eth?.address) walletAddress = String(eth.address).toLowerCase();
+    
+    // Check various possible locations for wallet address in Privy JWT
+    if (payload.wallet_address) {
+      walletAddress = payload.wallet_address.toLowerCase();
+      console.log(`[${req.requestId}] 💰 Found wallet via wallet_address`);
+    } else if (payload.linked_accounts && Array.isArray(payload.linked_accounts)) {
+      const ethAccount = payload.linked_accounts.find(acc => 
+        acc.type === 'wallet' && acc.chain_type === 'ethereum'
+      );
+      if (ethAccount?.address) {
+        walletAddress = ethAccount.address.toLowerCase();
+        console.log(`[${req.requestId}] 💰 Found wallet via linked_accounts`);
+      }
+    } else if (payload.user?.wallet_address) {
+      walletAddress = payload.user.wallet_address.toLowerCase();
+      console.log(`[${req.requestId}] 💰 Found wallet via user.wallet_address`);
+    } else {
+      // Additional fallback locations
+      if (payload.wallet?.address) {
+        walletAddress = payload.wallet.address.toLowerCase();
+        console.log(`[${req.requestId}] 💰 Found wallet via wallet.address`);
+      } else if (payload.address) {
+        walletAddress = payload.address.toLowerCase();
+        console.log(`[${req.requestId}] 💰 Found wallet via address`);
+      }
     }
 
     if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      console.error(`[${req.requestId}] ❌ No valid wallet address found in JWT. Available fields:`, Object.keys(payload));
       return res.status(401).json({ error: 'Authenticated wallet not found' });
     }
 
-    req.auth = { userId: data.user?.id || 'unknown', walletAddress };
+    const authDuration = Date.now() - startTime;
+    req.auth = { 
+      userId: payload.sub || payload.user_id || payload.id || 'unknown', 
+      walletAddress,
+      tokenIssuer: 'privy'
+    };
+    
+    console.log(`[${req.requestId}] ✅ Auth success: ${walletAddress} (${authDuration}ms)`);
     next();
   } catch (err) {
-    console.error(`[${req.requestId}] Privy auth error:`, err?.message || err);
-    return res.status(401).json({ error: 'Auth verification failed' });
+    const authDuration = Date.now() - startTime;
+    console.error(`[${req.requestId}] ❌ Privy JWT auth failed (${authDuration}ms):`, err?.message || err);
+    return res.status(401).json({ error: err.message || 'Auth verification failed' });
   }
 };
 
