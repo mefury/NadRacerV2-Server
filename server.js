@@ -697,44 +697,22 @@ const verifyPrivyAuth = async (req, res, next) => {
     // Verify JWT with complete cryptographic validation
     const payload = await verifyPrivyJWT(token);
     
-    // Extract wallet address from JWT payload with enhanced logging
-    let walletAddress = '';
+    // For this app, we don't expect wallet info in JWT - wallet comes from request body
+    // JWT is just for user authentication, not wallet binding
+    console.log(`[${req.requestId}] 🐛 JWT verification successful for user: ${payload.sub || payload.user_id || 'unknown'}`);
     
-    // Debug: Log the full payload structure (remove in production)
-    if (isDevelopment) {
-      console.log(`[${req.requestId}] 🐛 JWT payload keys:`, Object.keys(payload));
-    }
+    // Get wallet address from request body (this is how your app works)
+    const walletAddress = (req.body?.playerAddress || req.params?.playerAddress || '').toLowerCase();
     
-    // Check various possible locations for wallet address in Privy JWT
-    if (payload.wallet_address) {
-      walletAddress = payload.wallet_address.toLowerCase();
-      console.log(`[${req.requestId}] 💰 Found wallet via wallet_address`);
-    } else if (payload.linked_accounts && Array.isArray(payload.linked_accounts)) {
-      const ethAccount = payload.linked_accounts.find(acc => 
-        acc.type === 'wallet' && acc.chain_type === 'ethereum'
-      );
-      if (ethAccount?.address) {
-        walletAddress = ethAccount.address.toLowerCase();
-        console.log(`[${req.requestId}] 💰 Found wallet via linked_accounts`);
-      }
-    } else if (payload.user?.wallet_address) {
-      walletAddress = payload.user.wallet_address.toLowerCase();
-      console.log(`[${req.requestId}] 💰 Found wallet via user.wallet_address`);
-    } else {
-      // Additional fallback locations
-      if (payload.wallet?.address) {
-        walletAddress = payload.wallet.address.toLowerCase();
-        console.log(`[${req.requestId}] 💰 Found wallet via wallet.address`);
-      } else if (payload.address) {
-        walletAddress = payload.address.toLowerCase();
-        console.log(`[${req.requestId}] 💰 Found wallet via address`);
-      }
-    }
-
     if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
-      console.error(`[${req.requestId}] ❌ No valid wallet address found in JWT. Available fields:`, Object.keys(payload));
-      return res.status(401).json({ error: 'Authenticated wallet not found' });
+      console.error(`[${req.requestId}] ❌ No valid wallet address in request body/params`);
+      return res.status(400).json({ error: 'Missing or invalid playerAddress' });
     }
+    
+    console.log(`[${req.requestId}] 💰 Using wallet address from request: ${walletAddress}`);
+    
+    // TODO: Add additional security check to ensure the authenticated user 
+    // has permission to use this wallet address (future enhancement)
 
     const authDuration = Date.now() - startTime;
     req.auth = { 
