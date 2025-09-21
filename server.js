@@ -933,7 +933,32 @@ app.get('/api/player/:playerAddress', validateAddress, async (req, res) => {
 });
 
 // Nonce minting endpoint (one-time, short-lived)
-app.post('/api/session/:sid/nonce', verifyPrivyAuth, (req, res) => {
+// Note: This endpoint doesn't need playerAddress in body since it gets wallet from session
+app.post('/api/session/:sid/nonce', async (req, res) => {
+  // Custom auth for nonce endpoint that doesn't require playerAddress in body
+  try {
+    const isLocalhost = (req.hostname === 'localhost' || req.hostname === '127.0.0.1' || req.ip === '::1');
+    const authHeader = req.headers.authorization || '';
+
+    // Dev/localhost bypass
+    if (isDevelopment || isLocalhost) {
+      console.log(`[${req.requestId}] 🔓 Dev/localhost bypass for nonce endpoint`);
+    } else {
+      // Production auth - verify JWT but don't require playerAddress in body
+      if (!authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Missing bearer token' });
+      }
+      
+      const token = authHeader.slice(7);
+      const payload = await verifyPrivyJWT(token);
+      console.log(`[${req.requestId}] 🔐 Nonce endpoint JWT verified for user: ${payload.sub || payload.user_id || 'unknown'}`);
+    }
+  } catch (err) {
+    console.error(`[${req.requestId}] ❌ Nonce endpoint auth failed:`, err.message);
+    return res.status(401).json({ error: err.message || 'Auth verification failed' });
+  }
+  
+  // Nonce generation logic
   try {
     const { sid } = req.params;
     const session = activeGameSessions.get(sid);
